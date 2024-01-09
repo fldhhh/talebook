@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
 
-import functools
+import json
 import logging
 import os
-import queue
 import random
 import re
-import subprocess
-import threading
-import time
 import urllib
 from gettext import gettext as _
 
@@ -17,60 +13,15 @@ import tornado.escape
 from tornado import web
 
 from webserver import constants, loader, utils
+from webserver.services.convert import ConvertService
+from webserver.services.extract import ExtractService
+from webserver.services.mail import MailService
 from webserver.handlers.base import BaseHandler, ListHandler, auth, js
 from webserver.models import Item
 from webserver.plugins.meta import baike, douban
+from webserver.plugins.parser.txt import get_content_encoding
 
 CONF = loader.get_settings()
-_q = queue.Queue()
-
-
-def background(func):
-    @functools.wraps(func)
-    def run(*args, **kwargs):
-        def worker():
-            try:
-                func(*args, **kwargs)
-            except:
-                import logging
-                import traceback
-
-                logging.error("Failed to run background task:")
-                logging.error(traceback.format_exc())
-
-        t = threading.Thread(name="worker", target=worker)
-        t.setDaemon(True)
-        t.start()
-
-    return run
-
-
-def do_ebook_convert(old_path, new_path, log_path):
-    """convert book, and block, and wait"""
-    args = ["ebook-convert", old_path, new_path]
-    if new_path.lower().endswith(".epub"):
-        args += ["--flow-size", "0"]
-
-    timeout = 300
-    try:
-        timeout = int(CONF["convert_timeout"])
-    except:
-        pass
-
-    with open(log_path, "w") as log:
-        cmd = " ".join("'%s'" % v for v in args)
-        logging.info("CMD: %s" % cmd)
-        p = subprocess.Popen(args, stdout=log, stderr=subprocess.PIPE)
-        try:
-            _, stde = p.communicate(timeout=timeout)
-            logging.info("ebook-convert finish: %s, err: %s" % (new_path, bytes.decode(stde)))
-        except subprocess.TimeoutExpired:
-            p.kill()
-            logging.info("ebook-convert timeout: %s" % new_path)
-            log.info("ebook-convert timeout: %s" % new_path)
-            log.write(u"\n服务器转换书本格式时超时了。请在配置管理页面调大超时时间。\n[FINISH]")
-            return False
-        return True
 
 
 class Index(BaseHandler):
@@ -453,6 +404,8 @@ class BookUpload(BaseHandler):
         # read ebook meta
         with open(fpath, "rb") as stream:
             mi = get_metadata(stream, stream_type=fmt, use_libprs_metadata=True)
+            mi.title = utils.super_strip(mi.title)
+            mi.authors = [utils.super_strip(mi.author_sort)]
 
         if fmt.lower() == "txt":
             mi.title = name.replace(".txt", "")
@@ -495,21 +448,6 @@ class BookRead(BaseHandler):
         self.user_history("read_history", book)
         self.count_increase(book_id, count_download=1)
 
-        # check format
-        for fmt in ["epub", "mobi", "azw", "azw3", "txt"]:
-            fpath = book.get("fmt_%s" % fmt, None)
-            if not fpath:
-                continue
-            # epub_dir is for javascript
-            epub_dir = "/get/extract/%s" % book["id"]
-            is_ready = self.is_ready(book)
-            self.extract_book(book, fpath, fmt)
-            return self.html_page("book/read.html", {
-                "book": book,
-                "epub_dir": epub_dir,
-                "is_ready": is_ready,
-            })
-
         if "fmt_pdf" in book:
             # PDF类书籍需要检查下载权限。
             if not CONF["ALLOW_GUEST_DOWNLOAD"] and not self.current_user:
@@ -522,53 +460,91 @@ class BookRead(BaseHandler):
             pdf_reader_url = CONF["PDF_VIEWER"] % {"pdf_url": pdf_url}
             return self.redirect(pdf_reader_url)
 
+        if 'fmt_txt' in book:
+            # TXT有专门的阅读器
+            txt_reader_url = f'/book/{book_id}/readtxt'
+            return self.redirect(txt_reader_url)
+
+        # 其他格式，转换为EPUB进行在线阅读
+        for fmt in ["epub", "mobi", "azw", "azw3", "txt"]:
+            fpath = book.get("fmt_%s" % fmt, None)
+            if not fpath:
+                continue
+
+            if fmt != 'epub':
+                ConvertService().convert_and_save(self.user_id(), book, fpath, "epub")
+
+            # epub_dir is for javascript
+            epub_dir = "/get/extract/%s" % book["id"]
+            return self.html_page("book/read.html", {
+                "book": book,
+                "epub_dir": epub_dir,
+                "is_ready": (fmt == 'epub'),
+            })
         raise web.HTTPError(404, reason=_(u"抱歉，在线阅读器暂不支持该格式的书籍"))
 
-    def is_ready(self, book):
+
+class TxtRead(BaseHandler):
+    @js
+    @auth
+    def get(self):
+        bid = self.get_argument("id", "")
+        book = self.get_book(bid)
+        start = int(self.get_argument("start", "0"))
+        end = int(self.get_argument("end", "-1"))
+        logging.info(book)
+        fpath = book.get("fmt_txt", None)
+        if not fpath:
+            return {"err": "format error", "msg": "非txt书籍"}
+        with open(fpath, mode='rb') as file:
+            # 移动文件指针到起始位置
+            file.seek(start)
+            if end == -1:
+                content = file.read()
+            else:
+                # 读取从起始位置到结束位置的内容
+                content = file.read(end - start)
+        encode = get_content_encoding(content)
+        content = content.decode(encoding=encode, errors='ignore').replace("\r", "").replace("\n", "<br>")
+        return {"err": "ok", "content": content}
+
+
+class BookTxtInit(BaseHandler):
+    @js
+    def get(self):
+        bid = self.get_argument("id", "")
+        test_ready = self.get_argument("test", "")
+        logging.info("test_ready " + test_ready)
+        book = self.get_book(bid)
+        fpath = book.get("fmt_txt", None)
+        if not fpath:
+            return {"err": "format error", "msg": "非txt书籍"}
         # 解压后的目录
         fdir = os.path.join(CONF["extract_path"], str(book["id"]))
-        return os.path.isfile(fdir + "/META-INF/container.xml")
+        # txt 解析出的目录文件
+        content_path = fdir + "/content.json"
+        is_ready = os.path.isfile(content_path)
+        if is_ready:
+            with open(content_path, 'r', encoding='utf8') as f:
+                meta = json.loads(f.read())
+            return {"err": "ok", "msg": "已解析", "data": {
+                "content": meta['toc'],
+                "encoding": meta['encoding'],
+                "name": book["title"]
+            }}
+        if test_ready != "0":
+            return {"err": "ok", "msg": "未解析完成"}
 
-    @background
-    def extract_book(self, book, fpath, fmt):
-        # 解压后的目录
-        fdir = os.path.join(CONF["extract_path"], str(book["id"]))
-        subprocess.call(["mkdir", "-p", fdir])
-        if os.path.isfile(fdir + "/META-INF/container.xml"):
-            subprocess.call(["chmod", "a+rx", "-R", fdir + "/META-INF"])
-            return
-
-        progress_file = self.get_path_progress(book["id"])
-        new_path = ""
-        if fmt != "epub":
-            new_fmt = "epub"
-            new_path = os.path.join(
-                CONF["convert_path"],
-                "book-%s-%s.%s" % (book["id"], int(time.time()), new_fmt),
-            )
-            logging.info("convert book: %s => %s, progress: %s" % (fpath, new_path, progress_file))
-            os.chdir("/tmp/")
-
-            ok = do_ebook_convert(fpath, new_path, progress_file)
-            if not ok:
-                self.add_msg("danger", u"文件格式转换失败，请在QQ群里联系管理员.")
-                return
-
-            with open(new_path, "rb") as f:
-                self.db.add_format(book["id"], new_fmt, f, index_is_id=True)
-                logging.info("add new book: %s", new_path)
-            fpath = new_path
-
-        # extract to dir
-        logging.error("extract book: [%s] into [%s]", fpath, fdir)
-        os.chdir(fdir)
-        with open(progress_file, "a") as log:
-            log.write(u"Dir: %s\n" % fdir)
-            subprocess.call(["unzip", fpath, "-d", fdir], stdout=log)
-            subprocess.call(["chmod", "a+rx", "-R", fdir + "/META-INF"])
-            if new_path:
-                subprocess.call(["rm", new_path])
-        return
+        # 若未解析则计算预计等待时间，至少2分钟
+        wait = min(120, os.path.getsize(fpath) / (1024 * 1024) * 15)
+        ExtractService().parse_txt_content(bid, fpath)
+        que_len = ExtractService().get_queue('parse_txt_content').qsize()
+        return {"err": "ok", "msg": "已加入队列", "data": {
+            "wait": wait,
+            "name": book["title"],
+            "path": content_path,
+            "que": que_len
+        }}
 
 
 class BookPush(BaseHandler):
@@ -597,7 +573,7 @@ class BookPush(BaseHandler):
         for fmt in ["epub", "pdf"]:
             fpath = book.get("fmt_%s" % fmt, None)
             if fpath:
-                self.bg_send_book(book, mail_to, fmt, fpath)
+                MailService().send_book(self.user_id(), self.site_url, book, mail_to, fmt, fpath)
                 return {"err": "ok", "msg": _(u"服务器后台正在推送了。您可关闭此窗口，继续浏览其他书籍。")}
 
         # we do no have formats for kindle
@@ -607,82 +583,12 @@ class BookPush(BaseHandler):
                 "msg": _(u"抱歉，该书无可用于kindle阅读的格式"),
             }
 
-        self.bg_convert_and_send(book, mail_to)
+        ConvertService().convert_and_send(self.user_id(), self.site_url, book, mail_to)
         self.add_msg(
             "success",
             _(u"服务器正在推送《%(title)s》到%(email)s") % {"title": book["title"], "email": mail_to},
         )
         return {"err": "ok", "msg": _(u"服务器正在转换格式，稍后将自动推送。您可关闭此窗口，继续浏览其他书籍。")}
-
-    @background
-    def bg_send_book(self, book, mail_to, fmt, fpath):
-        self.do_send_mail(book, mail_to, fmt, fpath)
-
-    @background
-    def bg_convert_and_send(self, book, mail_to):
-        # https://www.amazon.cn/gp/help/customer/display.html?ref_=hp_left_v4_sib&nodeId=G5WYD9SAF7PGXRNA
-        fmt = "epub"  # best format for kindle
-        fpath = self.convert_to_mobi_format(book, fmt)
-        if fpath:
-            self.do_send_mail(book, mail_to, fmt, fpath)
-
-    def get_path_of_fmt(self, book, fmt):
-        """for mock test"""
-        from calibre.utils.filenames import ascii_filename
-
-        return os.path.join(CONF["convert_path"], "%s.%s" % (ascii_filename(book["title"]), fmt))
-
-    def convert_to_mobi_format(self, book, new_fmt):
-        new_path = self.get_path_of_fmt(book, new_fmt)
-        progress_file = self.get_path_progress(book["id"])
-
-        old_path = None
-        for f in ["txt", "azw3"]:
-            old_path = book.get("fmt_%s" % f, old_path)
-
-        logging.debug("convert book from [%s] to [%s]", old_path, new_path)
-        ok = do_ebook_convert(old_path, new_path, progress_file)
-        if not ok:
-            self.add_msg("danger", u"文件格式转换失败，请在QQ群里联系管理员.")
-            return None
-        with open(new_path, "rb") as f:
-            self.db.add_format(book["id"], new_fmt, f, index_is_id=True)
-        return new_path
-
-    def do_send_mail(self, book, mail_to, fmt, fpath):
-        from calibre.ebooks.metadata import authors_to_string
-
-        # read meta info
-        author = authors_to_string(book["authors"] if book["authors"] else [_(u"佚名")])
-        title = book["title"] if book["title"] else _(u"无名书籍")
-        fname = u"%s - %s.%s" % (title, author, fmt)
-        with open(fpath, "rb") as f:
-            fdata = f.read()
-
-        mail_args = {
-            "title": title,
-            "site_url": self.site_url,
-            "site_title": CONF["site_title"],
-        }
-        mail_from = self.settings["smtp_username"]
-        mail_subject = _(self.settings["push_title"]) % mail_args
-        mail_body = _(self.settings["push_content"]) % mail_args
-        status = msg = ""
-        try:
-            logging.info("send %(title)s to %(mail_to)s" % vars())
-            self.mail(mail_from, mail_to, mail_subject, mail_body, fdata, fname)
-            status = "success"
-            msg = _("[%(title)s] 已成功发送至Kindle邮箱 [%(mail_to)s] !!") % vars()
-            logging.info(msg)
-        except:
-            import traceback
-
-            logging.error("Failed to send to kindle: %s" % mail_to)
-            logging.error(traceback.format_exc())
-            status = "danger"
-            msg = traceback.format_exc()
-        self.add_msg(status, msg)
-        return
 
 
 def routes():
@@ -700,4 +606,6 @@ def routes():
         (r"/api/book/([0-9]+)/push", BookPush),
         (r"/api/book/([0-9]+)/refer", BookRefer),
         (r"/read/([0-9]+)", BookRead),
+        (r"/api/read/txt", TxtRead),
+        (r"/api/book/txt/init", BookTxtInit),
     ]
